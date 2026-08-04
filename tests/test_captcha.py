@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import os
 import tempfile
 import threading
@@ -55,6 +56,47 @@ from captcha import (
     start_capturing_sitekey,
 )
 from config import CaptchaConfig
+
+
+def _make_sse_response(protocol: str, text: str, response_id: str) -> Mock:
+    """Build a Mock requests.Response that streams *text* back as SSE.
+
+    Mirrors what an OpenAI-compatible provider returns when the request is sent
+    with ``stream: True``. Used because captcha._request_decision now consumes
+    the stream via _consume_sse_response instead of response.json().
+    """
+    if protocol == "chat_completions":
+        data = {"id": response_id, "choices": [{"delta": {"content": text}}]}
+        lines = ["data: " + json.dumps(data), "data: [DONE]"]
+    else:
+        delta_event = {
+            "type": "response.output_text.delta",
+            "response_id": response_id,
+            "delta": text,
+        }
+        completed_event = {
+            "type": "response.completed",
+            "response": {
+                "id": response_id,
+                "output_text": text,
+                "output": [
+                    {
+                        "type": "message",
+                        "content": [{"type": "output_text", "text": text}],
+                    }
+                ],
+            },
+        }
+        lines = [
+            "event: response.output_text.delta",
+            "data: " + json.dumps(delta_event),
+            "event: response.completed",
+            "data: " + json.dumps(completed_event),
+        ]
+    response = Mock(ok=True, status_code=200)
+    response.iter_lines = Mock(return_value=iter(lines))
+    response.close = Mock()
+    return response
 
 
 class FakeMouse:
@@ -639,21 +681,11 @@ class LLMCaptchaTests(unittest.IsolatedAsyncioTestCase):
         )
 
     def test_request_uses_image_and_strict_json_schema(self) -> None:
-        response = Mock(ok=True, status_code=200)
-        response.json.return_value = {
-            "id": "response-1",
-            "output": [
-                {
-                    "type": "message",
-                    "content": [
-                        {
-                            "type": "output_text",
-                            "text": '{"status":"solved","actions":[],"message":"done"}',
-                        }
-                    ],
-                }
-            ],
-        }
+        response = _make_sse_response(
+            "responses",
+            '{"status":"solved","actions":[],"message":"done"}',
+            "response-1",
+        )
         solver = LLMCaptchaSolver(
             "vision-model",
             "https://api.example.test/v1",
@@ -672,6 +704,7 @@ class LLMCaptchaTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(request.args[0], "https://api.example.test/v1/responses")
         body = request.kwargs["json"]
         self.assertEqual(body["model"], "vision-model")
+        self.assertTrue(body.get("stream"))
         self.assertEqual(body["reasoning"], {"effort": "high"})
         self.assertEqual(body["max_output_tokens"], 2048)
         self.assertTrue(body["text"]["format"]["strict"])
@@ -691,16 +724,14 @@ class LLMCaptchaTests(unittest.IsolatedAsyncioTestCase):
         )
 
     def test_dom_multi_select_request_allows_a_full_grid_batch(self) -> None:
-        response = Mock(ok=True, status_code=200)
-        response.json.return_value = {
-            "id": "response-1",
-            "output_text": (
-                '{"status":"actions","actions":[{"kind":"click",'
-                '"start_x":500,"start_y":500,"end_x":null,"end_y":null,'
-                '"grid_row":1,"grid_column":1}],"message":"top-left",'
-                '"coordinate_space":"normalized_1000"}'
-            ),
-        }
+        response = _make_sse_response(
+            "responses",
+            '{"status":"actions","actions":[{"kind":"click",'
+            '"start_x":500,"start_y":500,"end_x":null,"end_y":null,'
+            '"grid_row":1,"grid_column":1}],"message":"top-left",'
+            '"coordinate_space":"normalized_1000"}',
+            "response-1",
+        )
         solver = LLMCaptchaSolver(
             "vision-model",
             "https://api.example.test/v1",
@@ -726,21 +757,12 @@ class LLMCaptchaTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(decision.actions[0].start_y, 198.97)
 
     def test_chat_completions_request_uses_vision_and_json_schema(self) -> None:
-        response = Mock(ok=True, status_code=200)
-        response.json.return_value = {
-            "id": "chatcmpl-1",
-            "choices": [
-                {
-                    "message": {
-                        "role": "assistant",
-                        "content": (
-                            '{"status":"solved","actions":[],"message":"done",'
-                            '"coordinate_space":"normalized_1000"}'
-                        ),
-                    }
-                }
-            ],
-        }
+        response = _make_sse_response(
+            "chat_completions",
+            '{"status":"solved","actions":[],"message":"done",'
+            '"coordinate_space":"normalized_1000"}',
+            "chatcmpl-1",
+        )
         solver = LLMCaptchaSolver(
             "vision-model",
             "https://chat.example.test/v1",
@@ -763,6 +785,7 @@ class LLMCaptchaTests(unittest.IsolatedAsyncioTestCase):
         )
         body = request.kwargs["json"]
         self.assertEqual(body["model"], "vision-model")
+        self.assertTrue(body.get("stream"))
         self.assertEqual(body["reasoning_effort"], "high")
         self.assertEqual(body["max_tokens"], 2048)
         self.assertTrue(body["response_format"]["json_schema"]["strict"])
@@ -778,14 +801,12 @@ class LLMCaptchaTests(unittest.IsolatedAsyncioTestCase):
         )
 
     def test_request_retries_one_transient_network_failure(self) -> None:
-        response = Mock(ok=True, status_code=200)
-        response.json.return_value = {
-            "id": "response-1",
-            "output_text": (
-                '{"status":"solved","actions":[],"message":"done",'
-                '"coordinate_space":"normalized_1000"}'
-            ),
-        }
+        response = _make_sse_response(
+            "responses",
+            '{"status":"solved","actions":[],"message":"done",'
+            '"coordinate_space":"normalized_1000"}',
+            "response-1",
+        )
         solver = LLMCaptchaSolver(
             "vision-model",
             "https://api.example.test/v1",

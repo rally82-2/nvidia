@@ -1331,6 +1331,7 @@ class LLMCaptchaSolver:
                     },
                 },
                 "max_tokens": self.max_output_tokens,
+                "stream": True,
             }
             if self.reasoning_effort:
                 request_payload["reasoning_effort"] = self.reasoning_effort
@@ -1361,6 +1362,7 @@ class LLMCaptchaSolver:
                     }
                 },
                 "max_output_tokens": self.max_output_tokens,
+                "stream": True,
             }
             if self.reasoning_effort:
                 request_payload["reasoning"] = {"effort": self.reasoning_effort}
@@ -1392,6 +1394,7 @@ class LLMCaptchaSolver:
                         "Content-Type": "application/json",
                     },
                     json=request_payload,
+                    stream=True,
                     timeout=max(0.1, remaining),
                 )
             except requests.RequestException as exc:
@@ -1431,9 +1434,13 @@ class LLMCaptchaSolver:
         if response is None or not response.ok:
             raise RuntimeError(last_request_error or f"{api_name} request failed")
         try:
-            payload = response.json()
-        except ValueError as exc:
-            raise RuntimeError(f"{api_name} returned invalid JSON") from exc
+            streamed_text, payload = _consume_sse_response(
+                response, self.api_protocol, request_deadline
+            )
+        except (ValueError, RuntimeError) as exc:
+            raise RuntimeError(f"{api_name} stream error: {exc}") from exc
+        finally:
+            response.close()
         if not isinstance(payload, dict):
             raise RuntimeError(f"{api_name} returned a non-object JSON payload")
         output_text = (
@@ -1441,6 +1448,8 @@ class LLMCaptchaSolver:
             if self.api_protocol == "chat_completions"
             else _responses_output_text(payload)
         )
+        if not output_text:
+            output_text = streamed_text
         try:
             decision = _parse_llm_decision(
                 output_text,
@@ -3166,6 +3175,110 @@ def _chat_completion_output_text(payload: dict[str, Any]) -> str:
     if error:
         raise RuntimeError(f"Chat Completions API error: {str(error)[:300]}")
     raise RuntimeError("Chat Completions API response contained no output text")
+
+
+def _consume_sse_response(
+    response: "requests.Response",
+    api_protocol: str,
+    deadline: float | None,
+) -> tuple[str, dict[str, Any]]:
+    """Consume a streaming (SSE) LLM response and return (full_text, payload).
+
+    The request is sent with ``stream: True``; the provider replies with
+    Server-Sent Events. We assemble the incremental text deltas and rebuild a
+    payload compatible with the existing ``_chat_completion_output_text`` /
+    ``responses_output_text`` parsers so the rest of the pipeline is unchanged.
+
+    Handles both OpenAI-compatible protocols:
+    - ``chat_completions``: ``data: {"choices":[{"delta":{"content":"..."}}]}``
+      ending with ``data: [DONE]``.
+    - ``responses``: ``event: response.output_text.delta`` +
+      ``data: {"type":"response.output_text.delta","delta":"..."}``, with a
+      final ``event: response.completed`` carrying the full response object.
+    """
+    text_chunks: list[str] = []
+    final_payload: dict[str, Any] = {}
+    response_id: str | None = None
+    usage: dict[str, Any] | None = None
+    event_type = ""
+
+    def _enforce_deadline() -> None:
+        if deadline is not None and time.monotonic() > deadline:
+            raise RuntimeError("LLM SSE stream exceeded request deadline")
+
+    response.encoding = "utf-8"
+    try:
+        for raw_line in response.iter_lines(decode_unicode=True):
+            _enforce_deadline()
+            if raw_line is None:
+                continue
+            line = raw_line.strip()
+            if not line or line.startswith(":"):
+                continue
+            if line.startswith("event:"):
+                event_type = line[len("event:"):].strip()
+                continue
+            if not line.startswith("data:"):
+                continue
+            data_str = line[len("data:"):].strip()
+            if data_str == "[DONE]":
+                break
+            try:
+                data = json.loads(data_str)
+            except ValueError:
+                continue
+            if not isinstance(data, dict):
+                continue
+
+            rid = data.get("response_id") or data.get("id")
+            if isinstance(rid, str):
+                response_id = rid
+            u = data.get("usage")
+            if isinstance(u, dict):
+                usage = u
+
+            if api_protocol == "chat_completions":
+                choices = data.get("choices")
+                if isinstance(choices, list) and choices:
+                    delta = (
+                        choices[0].get("delta")
+                        if isinstance(choices[0], dict)
+                        else None
+                    )
+                    if isinstance(delta, dict):
+                        piece = delta.get("content")
+                        if isinstance(piece, str):
+                            text_chunks.append(piece)
+            else:
+                etype = data.get("type") or event_type
+                if etype == "response.completed":
+                    completed = data.get("response")
+                    if isinstance(completed, dict):
+                        final_payload = completed
+                piece = data.get("delta")
+                if isinstance(piece, str) and etype in (
+                    "response.output_text.delta",
+                    "response.refusal.delta",
+                ):
+                    text_chunks.append(piece)
+    except requests.exceptions.RequestException as exc:
+        raise RuntimeError(f"LLM SSE stream interrupted: {exc}") from exc
+
+    text = "".join(text_chunks).strip()
+    if api_protocol == "chat_completions":
+        payload: dict[str, Any] = {
+            "id": response_id,
+            "choices": [{"message": {"content": text, "refusal": None}}],
+            "usage": usage,
+        }
+    else:
+        payload = final_payload or {
+            "id": response_id,
+            "output_text": text,
+            "output": [{"content": [{"type": "output_text", "text": text}]}],
+            "usage": usage,
+        }
+    return text, payload
 
 
 def _parse_llm_decision(
