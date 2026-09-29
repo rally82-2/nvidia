@@ -1,0 +1,276 @@
+# ⚠️ **参考样例，非池交付物**（init 归平台/使用方维护，不进池的部署范畴）——
+#   在目标 repo 里落地成 `.github/workflows/act_pubx.yaml`。
+#
+# 它做什么：收到池/CLI 派发的 `payload`（base64 信封）→ 用 repo Secret 里的私钥解开 → 跑脚本 →
+# 打印收工标记 `会话已结束 (rc=N)`（池侧就靠这行取**真实 rc**，取不到才按 conclusion 映射）。
+#
+# ## 与**原 act-pubx（v5 模版）对齐到可互用**（同一份资源，两边都能派发）
+#
+#   面 | 对齐点
+#   ----|----
+#   Secret 名   | `ACT_PUBX_D0`（= 原版 `ACT_PUBX_SECRET` 的默认值；**名字不一致会互相拆台**）
+#   公钥文件名  | `.act_pubx.pub`（S/MIME 证书）/ `.act_pubx.spki`（裸 SPKI，给 WebCrypto）
+#   信封        | 两种同门：解码后首字符 `{` → hybrid `{v,k,n,c}`；否则 → `openssl smime`（DER）
+#   inputs 面   | 9 个，与原版**同名同义**（形态自己额外认的输入由那份模版自己声明）
+#   收工标记    | `会话已结束 (rc=N)`
+#   缓存        | **同格式**：key 前缀 `actcache-<ns>-`、内容 `lc.tar.ct` + `d.ct`（见下）
+#
+#   兼容位（**声明了但本形态不实现**，只为原版派发不 422）：
+#   `group` / `store_url` / `store_interval` —— 组存储不在此实现，带 `group` 时会打一条 warning
+#   （不静默降级）；真要组存储请用原版模版（它是会话形态才需要的东西）。
+#
+# ## 输出铁律（**一律不直出**，2026-09-29 定）
+#
+#   这类资源多半在**公开仓库**上，workflow 日志 = 对全世界可见。所以：
+#   **脚本自身的 stdout/stderr 一概不进日志**（收进临时文件，随 runner 销毁）。
+#   不进日志的只有**载荷内容**；我们自己的协议行（准备 / 解信封 / 收工标记 / 报错）照常进日志
+#   —— 那正是排查“准备阶段就死”的现场（见 ../NOTES.md §4.1）。
+#   想拿回脚本输出只能让它**自己往外送**（服务端接收 / ingest —— 契约已留位，实现待做）。
+#
+#   **已知残留（说清楚，不装看不见）**：GitHub 会把 step 的 `env:` 块打进日志，所以
+#   `PAYLOAD: <base64 密文>` 会出现在日志里 —— 那是**密文**（私钥在 Secret 里），不是明文；
+#   而它不是 Secret，所以**不会**被 `***` 遮掉（Secret / github.token 都遮了）。
+#   明文只存在于 runner 的临时文件与进程内存里。要连密文也不进日志，只能换传输方式
+#   （派发里只放地址、runner 带着凭据去取密文）—— 那是契约层面的改动，未做。
+#
+# ## 缓存（公开仓库里只放密文）
+#
+#   `~/local-cache` → tar 单流 → AES-256-CBC（**随机口令**）→ 随机口令再用 **repo 公钥**包住。
+#   公开 cache 里因此只有两样密文：`lc.tar.ct`（数据）与 `d.ct`（口令）。没有 Secret 里那把
+#   私钥的人拿到也是垃圾（GitHub 官方口径：公开仓的 cache 等同公开文件）。
+#   会话/一次性用 `cache_ns` 分开（`actcache-ct-` / `actcache-oneoff-`，restore-keys 不互相命中）。
+#   解不开就**丢掉**（多半是换过密钥）—— 不把垃圾原样再传一份回公开缓存。
+#
+# 已在真机 GitHub 上验过（repo `rally82-2/drun`、`duck-2000/cliproxy-mgmt`）：
+#   信封 → 派发 → 反查 run → 从日志取**真实 rc**（`exit 7` → rc=7，job 保持绿）。
+#   验证入口：platforms/action/trigger/reference-send.py（发端参考）—— 见同目录 README §4。
+
+name: act_pubx
+
+on:
+  workflow_dispatch:
+    inputs:
+      payload:
+        description: base64(信封)
+        required: true
+      os:
+        description: runner 标签
+        required: false
+        default: ubuntu-latest
+      timeout:
+        description: 有效工作时长（分钟）
+        required: false
+        default: "10"
+      job_timeout:
+        description: job 硬上限（分钟）—— 本形态由下面那行封住，这里收下表但不用
+        required: false
+        default: "30"
+      cache:
+        description: "1=启用缓存, 0=关闭（池默认 0；要缓存给资源写 attrs.cache=1）"
+        required: false
+        default: "0"
+      cache_ns:
+        description: "缓存命名空间：会话=ct / 一次性=oneoff（两边互不还原）"
+        required: false
+        default: oneoff
+      # ---- 以下三个是**兼容位**（原版组存储用；本形态声明但不实现）----
+      group:
+        description: "组名（兼容位：本形态不实现组存储，只用它报一句降级）"
+        required: false
+        default: ""
+      store_url:
+        description: "组存储工具地址（兼容位，忽略）"
+        required: false
+        default: ""
+      store_interval:
+        description: "组存储推送间隔秒（兼容位，忽略）"
+        required: false
+        default: "900"
+
+# 只读：这条 workflow 不需要写权限（cache 走 runtime token，不吃 GITHUB_TOKEN 的 scope）
+permissions:
+  contents: read
+
+jobs:
+  run:
+    runs-on: ${{ inputs.os }}
+    # **形态即闸门**：有效工作时长 4h（240min）+ 20min 备份窗口（缓存归档/收尾）。
+    # 契约 `molds[act_pubx].ttl_max: 14400` 说的是"**请求**上限"，不是 job 上限 —— 两者差那 20min。
+    # 要更长/更短就换个形态（另一份模版），而不是让调用方随便传。
+    timeout-minutes: 260
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 准备
+        id: prep
+        env:
+          ACT_PUBX_D0: ${{ secrets.ACT_PUBX_D0 }}
+          PAYLOAD: ${{ inputs.payload }}
+          GRP: ${{ inputs.group }}
+          T0: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ -z "${ACT_PUBX_D0:-}" ]; then
+            echo "::error::缺 Secret ACT_PUBX_D0（PEM 私钥）—— 见 platforms/action/init（init 会设它）"
+            exit 1
+          fi
+          umask 077
+          K="$RUNNER_TEMP/d0"; mkdir -p "$K"
+          printf '%s' "$ACT_PUBX_D0" > "$K/d0.bin"
+          D="$RUNNER_TEMP/actx"; mkdir -p "$D"
+          # repo 里的公开材料（无害）用来包装缓存口令；取不到就本轮不做缓存（会话不受影响）
+          curl -fsS -H "Authorization: Bearer $T0" -H "Accept: application/vnd.github.raw" -o "$K/e0.bin" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/contents/.act_pubx.pub?ref=$GITHUB_REF_NAME" \
+            || curl -fsS -o "$K/e0.bin" \
+                 "https://raw.githubusercontent.com/$GITHUB_REPOSITORY/$GITHUB_REF_NAME/.act_pubx.pub" \
+            || echo "::warning::取公开材料失败 → 本轮不做缓存(会话不受影响)"
+          printf '%s' "$PAYLOAD" | base64 -d > "$D/p.ct"
+          # 两种信封（管道其余部分完全一致）：
+          #   {v,k,n,c} → WebCrypto 客户端（worker / 浏览器 / Deno / 边缘）：AES-256-CBC(脚本)
+          #               + RSA-OAEP-SHA256 把 32 字节密钥**当 hex 文本**包起来
+          #   其它(DER) → 传统 S/MIME：本地 act-pubx / curl / python 客户端
+          if [ "$(head -c 1 "$D/p.ct")" = "{" ]; then
+            # 私钥路径当**参数**传进来 —— 它不在载荷目录里（$K 与 $D 是两个目录）。
+            # 早先这里把私钥拼成了载荷目录里的 d0.bin（用 $D 而不是 $K）→ openssl 报“打不开文件”
+            # → 一切 hybrid 载荷都解不开（而 smime 走 else 分支照旧正常，看着像密钥问题）。
+            python3 - "$D" "$K/d0.bin" <<'PY'
+          import base64, json, os, subprocess, sys
+          d, key = sys.argv[1], sys.argv[2]
+          env = json.load(open(os.path.join(d, "p.ct"), "rb"))
+          # MGF1 也要 SHA-256：WebCrypto 的 RSA-OAEP-SHA256 两侧同哈希（不写会退回 SHA-1 而解不开）
+          cek = subprocess.run(
+              ["openssl", "pkeyutl", "-decrypt", "-inkey", key,
+               "-pkeyopt", "rsa_padding_mode:oaep",
+               "-pkeyopt", "rsa_oaep_md:sha256",
+               "-pkeyopt", "rsa_mgf1_md:sha256"],
+              input=base64.b64decode(env["k"]), capture_output=True, check=True).stdout.decode().strip()
+          open(os.path.join(d, "cek.hex"), "w").write(cek)
+          open(os.path.join(d, "c.bin"), "wb").write(base64.b64decode(env["c"]))
+          open(os.path.join(d, "iv.hex"), "w").write(bytes.fromhex(env["n"]).hex())
+          PY
+            openssl enc -d -aes-256-cbc \
+              -K "$(cat "$D/cek.hex")" -iv "$(cat "$D/iv.hex")" \
+              -in "$D/c.bin" -out "$D/p.sh"
+            rm -f "$D/cek.hex" "$D/c.bin" "$D/iv.hex"
+          else
+            openssl smime -decrypt -binary -inform DER -inkey "$K/d0.bin" -in "$D/p.ct" -out "$D/p.sh"
+          fi
+          chmod 700 "$D/p.sh"
+          # 兼容位：组存储本形态不实现 —— 说清楚，不让它静默降级
+          if [ -n "${GRP:-}" ]; then
+            echo "::warning::收到 group=${GRP}，但本形态不实现组存储（兼容降级）；组会话请用原版模版"
+          fi
+          # 缓存暂存目录：优先 /mnt（大分区，3-5GB 级靠得住），不行退回 $HOME
+          CD=""
+          if sudo mkdir -p /mnt/actcache 2>/dev/null && sudo chown "$(id -u):$(id -g)" /mnt/actcache 2>/dev/null; then
+            CD=/mnt/actcache
+          fi
+          [ -n "$CD" ] || CD="$HOME/actcache"
+          mkdir -p "$CD"
+          echo "cachedir=$CD" >> "$GITHUB_OUTPUT"
+          echo "就绪：私钥 $K/d0.bin · 载荷 $D/p.sh · 缓存目录 $CD"
+
+      # 缓存命名空间（cache_ns）：会话 ct / 一次性 oneoff —— 两个前缀互不为前缀，
+      # 所以 restore-keys 不会把对方那份还原过来。
+      - name: 恢复加密缓存
+        if: inputs.cache != '0' && steps.prep.outputs.cachedir != ''
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ steps.prep.outputs.cachedir }}
+          key: ${{ runner.os }}-actcache-${{ inputs.cache_ns }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            ${{ runner.os }}-actcache-${{ inputs.cache_ns }}-
+
+      - name: 解密并展开缓存
+        if: inputs.cache != '0' && steps.prep.outputs.cachedir != ''
+        env:
+          CD: ${{ steps.prep.outputs.cachedir }}
+        run: |
+          set -uo pipefail
+          K="$RUNNER_TEMP/d0"
+          KC="$CD/d.ct"
+          # 兼容改名前的旧文件名（那时包口令的文件叫 k.ct）：认出来 → 走同一条路，
+          # 解不开就如实报"解不开"，而不是伪装成"没有缓存"（否则这类漂移会静默吃缓存）
+          [ -s "$KC" ] || { [ -s "$CD/k.ct" ] && KC="$CD/k.ct"; }
+          if [ ! -s "$CD/lc.tar.ct" ] || [ ! -s "$KC" ]; then
+            echo "无可用缓存（首次运行或未命中） → 从空开始"
+            exit 0
+          fi
+          if ! ACT_CACHE_D=$(openssl smime -decrypt -inform DER -inkey "$K/d0.bin" -in "$KC" 2>/dev/null); then
+            # 解不开 = 这份缓存是用**另一对密钥**的公钥包的（换过密钥）。留着没用，
+            # 还会被后面"打包"那步原样再传一份 → 直接丢掉，不给公开缓存塞垃圾。
+            rm -f "$CD/lc.tar.ct" "$KC"
+            echo "::warning::缓存解不开（repo 公开材料与 Secret 不是同一对 → 换过密钥？）→ 丢弃这份缓存"
+            exit 0
+          fi
+          export ACT_CACHE_D
+          ST="$HOME/.actcache-incoming"; rm -rf "$ST"; mkdir -p "$ST"
+          if openssl enc -d -aes-256-cbc -pbkdf2 -pass env:ACT_CACHE_D -in "$CD/lc.tar.ct" \
+               | tar -C "$ST" -xf -; then
+            if [ ! -e "$HOME/local-cache" ]; then
+              mv "$ST/local-cache" "$HOME/local-cache"
+            else
+              cp -a "$ST/local-cache/." "$HOME/local-cache/"
+            fi
+            rm -rf "$ST"
+            echo "✓ 缓存已就位: $(du -sh "$HOME/local-cache" 2>/dev/null | cut -f1)"
+          else
+            rm -rf "$ST"
+            echo "::warning::缓存解密/展开失败 → 跳过本次缓存"
+          fi
+
+      - name: 执行
+        run: |
+          set +e
+          D="$RUNNER_TEMP/actx"
+          # **铁律（2026-09-29 定）**：脚本自身的 stdout/stderr **一概不进日志**。
+          # 为什么：这类资源多半是**公开仓库**，而 workflow 日志对全世界可见 —— 脚本输出直接进日志
+          # 就等于外泄。**不是**靠“反正内容加密了”兜底：日志本身是明文的，所以只能是“不输出”。
+          # 于是两个流都收进 $D/out.log（只留在 runner 上，job 结束随机器销毁）：
+          # 想拿回输出只能让脚本**自己往外送**（服务端接收 / ingest —— 契约已留位，实现待做）。
+          # 注意：我们自己的协议行（准备 / 解信封 / 收工标记 / 报错）**照常进日志** —— 它们不含载荷内容，
+          # 而且正是排查“准备阶段就死”的唯一现场（见 ../NOTES.md §4.1）。
+          bash "$D/p.sh" > "$D/out.log" 2>&1
+          rc=$?
+          # 收工标记：池侧取的是**这行**里的真实 rc（rc 不含脚本内容）
+          echo "会话已结束 (rc=$rc)"
+          # 刻意 exit 0：脚本非零不算 workflow 失败 —— 真实 rc 已经由上面那行带回；
+          # 这样 job 保持绿，日志/结论都干净（池侧优先读标记，读不到才按 conclusion 映射）
+          exit 0
+        shell: bash
+        # 只封"有效工作时长"，那 20min 备份窗口留给缓存归档（与 job 级 260 配套）
+        timeout-minutes: ${{ fromJSON(inputs.timeout) }}
+
+      # 打包放**保存之前**，且 always()：执行被软超时/失败/取消打断也要把缓存留下来
+      - name: 打包缓存
+        if: always() && inputs.cache != '0' && steps.prep.outputs.cachedir != ''
+        env:
+          CD: ${{ steps.prep.outputs.cachedir }}
+        run: |
+          set -uo pipefail
+          K="$RUNNER_TEMP/d0"
+          if [ ! -d "$HOME/local-cache" ]; then echo "没有 ~/local-cache → 不保存"; exit 0; fi
+          if [ ! -s "$K/e0.bin" ]; then echo "::warning::缺少公开材料 → 不保存缓存"; exit 0; fi
+          rm -f "$CD/lc.tar.ct" "$CD/d.ct"
+          ACT_CACHE_D=$(openssl rand -hex 32); export ACT_CACHE_D
+          echo "打包 + 单流加密 (tar | openssl enc)…"
+          set +e
+          tar --warning=no-file-changed -C "$HOME" -cf - local-cache | \
+            openssl enc -aes-256-cbc -pbkdf2 -salt -pass env:ACT_CACHE_D > "$CD/lc.tar.ct"
+          ps=("${PIPESTATUS[@]}")
+          set -e
+          if [ "${ps[0]}" -le 1 ] && [ "${ps[1]}" -eq 0 ] && [ -s "$CD/lc.tar.ct" ]; then
+            printf '%s' "$ACT_CACHE_D" | openssl smime -encrypt -aes256 -binary -outform DER \
+              "$K/e0.bin" > "$CD/d.ct"
+            echo "✓ 密文 $(du -sh "$CD/lc.tar.ct" | cut -f1) 待上传（公开缓存里只有密文）"
+          else
+            rm -f "$CD/lc.tar.ct" "$CD/d.ct"
+            echo "::warning::打包/加密失败 (tar rc=${ps[0]}, enc rc=${ps[1]}) → 本次不保存"
+          fi
+
+      - name: 保存缓存
+        if: always() && inputs.cache != '0' && steps.prep.outputs.cachedir != ''
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ steps.prep.outputs.cachedir }}
+          key: ${{ runner.os }}-actcache-${{ inputs.cache_ns }}-${{ github.run_id }}-${{ github.run_attempt }}
